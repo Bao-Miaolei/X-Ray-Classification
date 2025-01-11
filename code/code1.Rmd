@@ -1,0 +1,493 @@
+---
+title: "Code"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Setting up
+knitr::opts_chunk$set(appendix=TRUE, echo = FALSE, warning=FALSE, message=FALSE)
+
+# Set working directory
+knitr::opts_knit$set(root.dir = "~/Desktop/NIH Chest X-ray")
+
+# Formats output to 3 digits
+options(digits = 3)
+
+#loading packages to be used
+library(ggplot2)
+library(scales)
+library(ggthemes)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(table1)
+library(purrr)
+library(keras3)
+
+#loading data
+chest_raw <- read_csv("sample_labels.csv")
+
+#data source: https://www.kaggle.com/datasets/nih-chest-xrays/sample
+
+```
+
+# Data Cleaning
+
+```{r, appendix = TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Data Cleaning
+chest <- chest_raw
+
+#Rename the columns
+colnames(chest) <- c("image_id","findings","follow_up_num","patient_id",
+                     "age","gender", "view_position","image_width",
+                     "image_height", "pixel_spacing_x","pixel_spacing_y")
+str(chest)
+
+#Add new columns representing each disease
+diseases <- c("Hernia", "Pneumonia","Fibrosis","Edema","Emphysema","Cardiomegaly",
+              "Pleural_Thickening","Consolidation","Pneumothorax","Mass","Nodule",
+              "Atelectasis","Effusion","Infiltration","No Finding") #total of 15 classes
+
+chest_disease <- chest %>%
+  bind_cols(
+    lapply(diseases, function(disease) {
+      as.integer(grepl(disease, chest$findings))
+    }) %>%
+    setNames(paste0(diseases))
+  )
+
+
+#Remove letters in Age
+chest_disease$age <- as.numeric(gsub('.{1}$', '', chest_disease$age))
+summary(chest_disease$age)
+chest_disease <- chest_disease %>% filter(age != max(age)) #remove outliers
+
+#Keep only one record for patients with repeated measures
+chest <- chest_disease %>%
+  group_by(patient_id) %>%      # Group by person ID or unique identifier
+  slice_sample(n = 1) %>%       # Randomly select one record per person
+  ungroup()
+
+```
+
+# Exploratory Data Analysis (EDA)
+
+```{r EDA, fig.width=16, fig.height=8, appendix = TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Exploratory Data Analysis
+
+#summarise follow_up_num
+chest_disease %>% ggplot(aes(x = as.numeric(follow_up_num))) +
+  geom_histogram(binwidth = 15) +
+  labs(title = "Summary of Follow Up Numbers",
+       x = "Follow Up Numbers",
+       y = "Count") +
+  theme_minimal()
+
+#summarise age
+chest %>% ggplot(aes(x = age)) +
+  geom_histogram(binwidth = 15) +
+  labs(title = "Summary of Age",
+       x = "Age",
+       y = "Count") +
+  theme_minimal()
+
+#summarize diseases and calculate percentage
+disease_summary <- chest_disease %>%
+  select(12:26) %>%
+  gather(key, val) %>%
+  group_by(key) %>%
+  summarise(Count = sum(val)) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>% # Calculate percentages
+  arrange(desc(Count)) 
+
+#reorder the Key names based on Count
+disease_summary$key <- factor(disease_summary$key, 
+                              levels = disease_summary$key[order(disease_summary$Count, 
+                                                                 decreasing = TRUE)])
+
+#create histogram with percentages
+ggplot(disease_summary, aes(x = key, y = Count, fill = key)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), vjust = -0.5, size = 3) + # Add percentage labels
+  labs(title = "Summary of Disease Findings", x = "Key", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.title = element_text(size = 8))
+
+
+#create a summary Table 1
+caption <- "Descriptive Statistics of NIH Chest X-ray Datset Sample"
+output <- table1(~follow_up_NO + age + gender + view_position + image_width + 
+                   image_height + pixel_spacing_x + pixel_spacing_y , 
+                 data = chest, caption=caption)
+output
+
+```
+
+# Image Preprocessing
+
+```{r image, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Image Preprocessing
+library(magick)
+
+# Path to the folder containing the images
+image_folder <- "~/Desktop/NIH Chest X-ray/sample/images"
+
+# Read and preprocess all images
+preprocess_images <- function(image_index) {
+  image_path <- file.path(image_folder, image_index)
+  if (file.exists(image_path)) {
+    image <- image_read(image_path) %>% # Load image
+      image_resize("64x64") %>% # Resize to a fixed dim for SVM 
+      #NOTE:224x224 provides more details for CNN
+      image_convert(type = "Grayscale")# Convert to grayscale
+    pixel_values <- as.numeric(image_data(image)) / 255 
+    # Normalize pixel intensity to range 0-1
+    return(pixel_values)
+  } else {
+    return(NULL) # Handle missing files
+  }
+}
+
+# Apply preprocessing to all Image Index entries
+
+preprocess_one <- preprocess_images(chest$image_id[1]) #test on one
+head(preprocess_one)
+
+
+chest <- chest %>%
+  rowwise() %>%
+  mutate(
+    image_data = list(preprocess_images(image_id)) # Store preprocessed images
+  )
+
+# Remove rows with missing images
+chest <- chest %>% filter(!is.null(image_data))
+
+# Normalize age and gender
+chest$age_norm <- (chest$age - mean(chest$age)) / sd(chest$age)
+chest$female <- ifelse(chest$gender == "F", 1, 0)
+```
+
+# Train-Test Split
+
+```{r split, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Train-Test Split
+set.seed(1)
+
+n <- nrow(chest)
+
+# Create a partition index (80% for training)
+train_index <- sample(1:n, size = 0.8 * n)
+
+# Split the data
+train_data <- chest[train_index, ]
+test_data <- chest[-train_index, ]
+
+# Check the dimensions
+# dim(train_data)
+# dim(test_data)
+
+# Convert into matrices for model use
+x_train <- train_data$image_data
+x_train <- matrix(unlist(x_train), nrow = length(x_train), byrow = TRUE)
+
+x_test <- test_data$image_data
+x_test <- matrix(unlist(x_test), nrow = length(x_test), byrow = TRUE)
+```
+
+# Support Vector Machine
+
+```{r SVM, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### SVM Model without tunning
+library(e1071)
+
+svm_models <- list()
+
+for (disease in diseases) {
+  # Define predictors and target
+  x_train <- x_train
+  y_train <- as.factor(train_data[[disease]])
+  
+  # Train SVM
+  svm_models[[disease]] <- svm(
+    x = x_train,
+    y = y_train,
+    type = "C-classification",
+    kernel = "linear", 
+    cost = 1
+  )
+}
+
+# Predict for the test set
+predictions <- data.frame(Image_Index = test_data$image_id)
+
+for (disease in diseases) {
+  predictions[[disease]] <- predict(svm_models[[disease]], x_test)
+}
+
+# View predictions
+print(head(predictions))
+```
+
+# SVM Evaluation
+
+```{r, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Evaluate the SVM Model
+
+# Write a function to obtain accuracy from confusion matrix
+get_accuracy <- function(disease) {
+  confusion_matrix <- table(
+    Predicted = predictions[[disease]],
+    Actual = test_data[[disease]]
+  )
+  disease_accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  return(disease_accuracy)
+}
+
+accuracy <- c()
+for(disease in diseases) {
+  accuracy <- c(accuracy, get_accuracy(disease))
+}
+names(accuracy) <- diseases
+
+print(as.data.frame(accuracy))
+```
+
+# SVM with Tuning
+
+```{r, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### SVM tuning with cross-validation and Evaluation
+library(e1071)
+library(MLmetrics)
+
+# Flatten matrices into a single matrix
+flattened_predictors <- t(sapply(train_data$image_data, as.vector))
+# Combine flattened predictors with the outcome
+x_train <- data.frame(flattened_predictors)
+y_train <- data.frame(train_data[,c(diseases)])
+
+set.seed(1)
+
+costs <- c(0.1, 1, 10) #grid for cost
+gammas <- c(0.1) #grid for gamma
+train_control <- tune.control(cross = 5) #5-fold cv
+f1_scores <- data.frame(Image_Index = test_data$image_id)
+
+
+# tuning for one disease label "Mass"
+tune_result <- tune.svm(x = x_train,
+                        y = y_train[["Mass"]],
+                        cost = costs, gamma = gammas, 
+                        kernel = "radial",  # RBF kernel (Gaussian)
+                        tunecontrol = train_control)
+# find the best model
+best_svm <- tune_result$best.model 
+# make prediction
+predictions <- predict(best_svm, newdata = test_data$image_data) 
+# evaluation with f1 score
+f1_score <- F1_Score(y_pred = predictions, y_true = test_data[["Mass"]])
+
+# apply for all disease labels
+for(disease in diseases) {
+  tune_result <- tune.svm(x = x_train,
+                        y = y_train[[disease]],
+                        cost = costs, gamma = gammas, 
+                        tunecontrol = train_control)
+  best_svm <- tune_result$best.model # find the best model
+  predictions <- predict(best_svm, newdata = test_data$image_data) # make prediction
+  f1_scores[[disease]] <- F1_Score(y_pred = predictions, y_true = test_data[[disease]])
+}
+
+# View F1 scores
+print(f1_scores)
+
+```
+
+
+# Support Vector Machine + Demographics Adjustment
+
+```{r, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Train the SVM Model
+
+svm_adj_models <- list()
+
+# Adjusting for Sex and Age
+x_train <- cbind(train_data$image_data,train_data$sex, train_data$age)
+x_train <- matrix(unlist(x_train), nrow = length(x_train), byrow = TRUE)
+x_test <- cbind(test_data$image_data, test_data$sex, test_data$age)
+x_test <- matrix(unlist(x_test), nrow = length(x_test), byrow = TRUE)
+
+for (disease in diseases) {
+  # Define predictors and target
+  x_train <- x_train
+  y_train <- as.factor(train_data[[disease]])
+  
+  # Train SVM
+  svm_adj_models[[disease]] <- svm(
+    x = x_train,
+    y = y_train,
+    type = "C-classification",
+    kernel = "linear", 
+    cost = 1
+  )
+}
+
+# Predict for the test set
+predictions_svm_adj <- data.frame(Image_Index = test_data$image_id)
+
+for (disease in diseases) {
+  predictions_svm_adj[[disease]] <- predict(svm_adj_models[[disease]], x_test)
+}
+
+# View sex and age adjusted predictions
+print(head(predictions_svm_adj))
+
+```
+
+# SVM Demographics Evaluation
+
+```{r, appendix=TRUE, eval = FALSE}
+### ----------------------------------------------------------- 
+### Evaluate the SVM Demographics Model with accuracy
+accuracy_svm_adj <- c()
+for(disease in diseases) {
+  accuracy_svm_adj <- c(accuracy_svm_adj, get_accuracy(disease))
+}
+accuracy_svm_adj <- accuracy_svm_adj %>% names(diseases) %>% as.data.frame()
+print(accuracy_svm_adj)
+```
+
+
+# Convolutional Neural Network
+
+```{r, appendix = TRUE, eval = FALSE}
+# Change formats
+x_train <- array_reshape(x_train, c(nrow(x_train), 64, 64, 1))
+x_test <- array_reshape(x_test, c(nrow(x_test), 64, 64, 1))
+
+# Define the CNN model
+model <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3, 3), activation = "relu", 
+                input_shape = c(64, 64, 1)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  
+  layer_flatten() %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(0.5) %>%
+  layer_dense(units = length(diseases), activation = "sigmoid")  
+  
+# Compile the model
+optimizer <- optimizer_adam(learning_rate = 0.01)  # Adjust learning rate
+model %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer,
+  metrics = c("accuracy")
+)
+
+set.seed(1)
+
+# Train the model
+y_train <- as.matrix(train_data[, diseases])
+y_test <- as.matrix(test_data[, diseases])
+
+history <- model %>% fit(
+  x_train, y_train,
+  epochs = 10,  
+  batch_size = 32,
+  validation_data = list(x_test, y_test)
+)
+```
+
+# CNN Evaluation
+
+```{r, appendix = TRUE, eval = FALSE}
+# Predict on the test set
+predictions_CNN <- model %>% predict(x_test)
+
+# Convert probabilities to binary labels (threshold = 0.5)
+predicted_labels <- ifelse(predictions_CNN > 0.5, 1, 0)
+
+disease_accuracies <- colMeans(predicted_labels == test_data[, diseases])
+disease_accuracies
+```
+
+# CNN with age and sex
+
+```{r, eval = FALSE}
+image_input <- layer_input(shape = c(64, 64, 1), name = "image_input")
+
+image_model <- image_input %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3, 3), activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(0.5)
+
+# Define the demographic input pathway
+demographic_input <- layer_input(shape = c(2), name = "demographic_input")
+
+demographic_model <- demographic_input %>%
+  layer_dense(units = 32, activation = "relu")
+
+# Combine image and demographic features
+combined <- layer_concatenate(list(image_model, demographic_model)) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(0.5) %>%
+  layer_dense(units = length(diseases), activation = "sigmoid")
+
+# Define the full model
+model_new <- keras_model(
+  inputs = list(image_input, demographic_input),
+  outputs = combined
+)
+
+# Compile the model
+optimizer <- optimizer_adam(learning_rate = 0.01)
+model_new %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer,
+  metrics = c("accuracy")
+)
+
+x_train_demographic <- as.matrix(data.frame(age = train_data$age_norm, 
+                                            gender = train_data$female))
+x_test_demographic <- as.matrix(data.frame(age = test_data$age_norm, 
+                                           gender = test_data$female))
+
+history_new <- model_new %>% fit(
+  list(x_train, x_train_demographic), y_train,
+  epochs = 10,
+  batch_size = 32,
+  validation_data = list(list(x_test, x_test_demographic), y_test)
+)
+
+predictions_new <- model_new %>% predict(list(x_test, x_test_demographic))
+
+predicted_labels_new <- ifelse(predictions_new > 0.5, 1, 0)
+
+disease_accuracies_new <- colMeans(predicted_labels_new == test_data[, diseases])
+```
+
+
+
+
+```{r ref.label=knitr::all_labels(appendix == TRUE), echo=TRUE, eval=FALSE, include=TRUE}
+```
+
+
+
+
